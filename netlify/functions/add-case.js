@@ -1,0 +1,118 @@
+const https = require('https');
+const OWNER = process.env.GITHUB_OWNER;
+const REPO  = process.env.GITHUB_REPO;
+const TOKEN = process.env.GITHUB_TOKEN;
+const FILE  = 'data/cases.json';
+
+function ghRequest(method, path, body) {
+  return new Promise((resolve, reject) => {
+    const data = body ? JSON.stringify(body) : null;
+    const req = https.request({
+      hostname: 'api.github.com',
+      path: `/repos/${OWNER}/${REPO}/contents/${path}`,
+      method,
+      headers: {
+        'Authorization': `token ${TOKEN}`,
+        'User-Agent': 'smartdesign-netlify',
+        'Content-Type': 'application/json',
+        ...(data ? {'Content-Length': Buffer.byteLength(data)} : {})
+      }
+    }, (res) => {
+      let raw = '';
+      res.on('data', d => raw += d);
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, body: JSON.parse(raw) }); }
+        catch(e) { resolve({ status: res.statusCode, body: raw }); }
+      });
+    });
+    req.on('error', reject);
+    if (data) req.write(data);
+    req.end();
+  });
+}
+
+async function readCases() {
+  const res = await ghRequest('GET', FILE);
+  if (res.status === 404) return { cases: [], sha: null };
+  if (res.status !== 200) throw new Error(`GitHub read error: ${res.status}`);
+  const content = Buffer.from(res.body.content, 'base64').toString('utf8');
+  return { cases: JSON.parse(content), sha: res.body.sha };
+}
+
+async function writeCases(cases, sha, message) {
+  const content = Buffer.from(JSON.stringify(cases, null, 2)).toString('base64');
+  const body = { message, content, ...(sha ? { sha } : {}) };
+  const res = await ghRequest('PUT', FILE, body);
+  if (res.status !== 200 && res.status !== 201)
+    throw new Error(`GitHub write error: ${res.status} — ${JSON.stringify(res.body)}`);
+  return res;
+}
+
+function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
+
+exports.handler = async (event) => {
+  const headers = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Content-Type': 'application/json'
+  };
+  if (event.httpMethod === 'OPTIONS') return { statusCode: 200, headers, body: '' };
+  if (event.httpMethod !== 'POST') return { statusCode: 405, headers, body: JSON.stringify({ message: 'Method not allowed' }) };
+
+  let parsed;
+  try { parsed = JSON.parse(event.body); }
+  catch { return { statusCode: 400, headers, body: JSON.stringify({ message: '요청 형식 오류' }) }; }
+
+  const { password, action, id, title, location, service, date, description, image, tags } = parsed;
+
+  if (!process.env.ADMIN_PASS)
+    return { statusCode: 500, headers, body: JSON.stringify({ message: 'ADMIN_PASS 환경변수를 Netlify에 설정해주세요.' }) };
+  if (password !== process.env.ADMIN_PASS)
+    return { statusCode: 401, headers, body: JSON.stringify({ message: '비밀번호가 올바르지 않습니다.' }) };
+
+  // 비밀번호 확인만 (verify)
+  if (action === 'verify')
+    return { statusCode: 200, headers, body: JSON.stringify({ message: '인증 성공' }) };
+
+  // GitHub 작업
+  if (!TOKEN || !OWNER || !REPO)
+    return { statusCode: 500, headers, body: JSON.stringify({ message: 'GITHUB_TOKEN / GITHUB_OWNER / GITHUB_REPO 환경변수를 설정해주세요.' }) };
+
+  try {
+    const { cases, sha } = await readCases();
+
+    if (action === 'delete') {
+      if (!id) return { statusCode: 400, headers, body: JSON.stringify({ message: 'id 필요' }) };
+      const updated = cases.filter(c => c.id !== id);
+      if (updated.length === cases.length)
+        return { statusCode: 404, headers, body: JSON.stringify({ message: '항목을 찾을 수 없습니다.' }) };
+      await writeCases(updated, sha, `삭제: ${id}`);
+      return { statusCode: 200, headers, body: JSON.stringify({ message: '삭제 완료' }) };
+    }
+
+    if (action === 'update') {
+      if (!id) return { statusCode: 400, headers, body: JSON.stringify({ message: 'id 필요' }) };
+      const idx = cases.findIndex(c => c.id === id);
+      if (idx === -1) return { statusCode: 404, headers, body: JSON.stringify({ message: '항목을 찾을 수 없습니다.' }) };
+      cases[idx] = { ...cases[idx], title, location, service, date, description, image: image||'', tags: tags||[] };
+      await writeCases(cases, sha, `수정: ${title}`);
+      return { statusCode: 200, headers, body: JSON.stringify({ message: '수정 완료' }) };
+    }
+
+    // 추가
+    if (!title || !location || !service || !date || !description)
+      return { statusCode: 400, headers, body: JSON.stringify({ message: '필수 항목이 누락되었습니다.' }) };
+    const nc = {
+      id: uid(), title, location, service, date, description,
+      image: image||'',
+      tags: Array.isArray(tags) ? tags : (tags ? tags.split(',').map(t=>t.trim()).filter(Boolean) : [])
+    };
+    cases.unshift(nc);
+    await writeCases(cases, sha, `추가: ${title}`);
+    return { statusCode: 201, headers, body: JSON.stringify({ message: '추가 완료', id: nc.id }) };
+
+  } catch (err) {
+    console.error('Function error:', err);
+    return { statusCode: 500, headers, body: JSON.stringify({ message: err.message || '서버 오류' }) };
+  }
+};
